@@ -67,6 +67,10 @@ const SHADOW_CENTER_Y = GROUND_Y + 28;
 
 /** Длительность анимации «нагнуться и положить динамит» (секунды). */
 const PLACE_DYNAMITE_DURATION = 0.85;
+/** Длительность удара ножом (секунды). */
+const KNIFE_ATTACK_DURATION = 0.45;
+/** Подъём охотника над полом во время длинного прыжка (px). */
+const LONG_JUMP_LIFT = 52;
 /** Насколько далеко перед охотником кладётся динамит (пиксели мира / экрана). */
 const DYNAMITE_PLACE_OFFSET = 55;
 /** Размер динамита на экране (большая сторона, px) — один и тот же в руках и на земле. */
@@ -111,10 +115,26 @@ const PIT_MAX_GAP_M = 200;
 /** Размер ямы на экране (px). */
 const PIT_DRAW_W = 488;
 const PIT_DRAW_H = 112;
+/** Минимальный зазор между ямой и перегородкой (метры). */
+const PIT_WALL_MIN_GAP_M = 2;
+/** Длина длинного прыжка: ширина ямы + запас (px мира). */
+const LONG_JUMP_DISTANCE = PIT_DRAW_W + 30;
+/** Скорость прыжка вперёд (px мира / сек). */
+const LONG_JUMP_SPEED = LONG_JUMP_DISTANCE / 0.6;
 /** Длительность провала в яму (сек). */
 const PIT_FALL_DURATION = 0.75;
 /** Запас ниже нижнего края канваса, чтобы спрайт полностью скрылся. */
 const PIT_SINK_BELOW_CANVAS = 32;
+
+/** Случайный зазор между мумиями в секторе перед стеной (метры). */
+const MUMMY_MIN_GAP_M = 200;
+const MUMMY_MAX_GAP_M = 400;
+/** Высота спрайта мумии — на 20% больше охотника. */
+const MUMMY_DRAW_H = HUNTER_DRAW_H * 1.2;
+/** Скорость мумии навстречу охотнику (px мира / сек). */
+const MUMMY_SPEED = 130;
+/** Отступ мумий от левого края перегородки (px). */
+const MUMMY_WALL_MARGIN = 90;
 
 // ---------------------------------------------------------------------------
 // Canvas и состояние игры
@@ -186,6 +206,12 @@ let restartBtn = null;
  */
 let placeAction = null;
 
+/** Текущая анимация удара ножом или null: { elapsed }. */
+let knifeAction = null;
+
+/** Активный длинный прыжок или null: { remainingPx, dir }. dir: 1 вправо, -1 влево. */
+let longJump = null;
+
 /**
  * Метрики спрайтов больше не читаем через getImageData —
  * при file:// / локальной загрузке canvas «заражался» (CORS) и падал с SecurityError.
@@ -222,6 +248,15 @@ const bats = [];
  */
 const spikePits = [];
 
+/**
+ * Мумии: { worldX, active }.
+ * active — начала двигаться навстречу охотнику, когда попала на экран.
+ */
+const mummies = [];
+
+/** Ключи секторов, где мумии уже расставлены (чтобы не дублировать). */
+const mummySegmentsSpawned = new Set();
+
 /** Загруженные картинки: фон, охотник, динамит, взрыв, мыши, яма. */
 const assets = {
   bg: loadImage("assets/images/pyramid-dungeon-bg.jpg"),
@@ -231,12 +266,15 @@ const assets = {
   hunterPlace: loadImage("assets/images/hunter-place.png"),
   hunterCrouch: loadImage("assets/images/hunter-crouch.png"),
   hunterDead: loadImage("assets/images/hunter-dead.png"),
+  hunterKnife: loadImage("assets/images/hunter-knife.png"),
+  hunterJumpLong: loadImage("assets/images/hunter-jump-long.png"),
   hunterFly: loadImage("assets/images/hunter-fly.png"),
   dynamite: loadImage("assets/images/dynamite.png"),
   explosion: loadImage("assets/images/explosion.png"),
   batHang: loadImage("assets/images/bat.png"),
   batFly: loadImage("assets/images/bat-fly.png"),
   spikePit: loadImage("assets/images/spike-pit.png"),
+  mummy: loadImage("assets/images/mummy.png"),
 };
 
 /** Сколько шагов (смен спрайта) в секунду при ходьбе. */
@@ -316,6 +354,73 @@ function ensureWallsAhead() {
   }
 }
 
+function getSortedWalls() {
+  return walls.slice().sort((a, b) => a.worldX - b.worldX);
+}
+
+function randomMummyGapMeters() {
+  return MUMMY_MIN_GAP_M + Math.random() * (MUMMY_MAX_GAP_M - MUMMY_MIN_GAP_M);
+}
+
+/** Левая граница сектора перед targetWall (после последней разрушенной стены). */
+function getSegmentLeftBeforeWall(targetWall) {
+  let left = 0;
+  for (const wall of getSortedWalls()) {
+    if (wall.worldX >= targetWall.worldX) break;
+    if (wall.destroyed) left = wall.worldX + WALL_THICKNESS;
+  }
+  return left;
+}
+
+/** Ближайшая целая стена правее worldX. */
+function getNextIntactWallAfter(worldX) {
+  for (const wall of getSortedWalls()) {
+    if (!wall.destroyed && wall.worldX > worldX) return wall;
+  }
+  return null;
+}
+
+/**
+ * Расставляет мумии с шагом 200–400 м в [left, right).
+ * key — уникальный идентификатор сектора.
+ */
+function spawnMummiesInRange(left, right, key) {
+  if (mummySegmentsSpawned.has(key)) return;
+  if (right - left < MUMMY_MIN_GAP_M * PX_PER_METER * 0.5) return;
+
+  let x = left + randomMummyGapMeters() * PX_PER_METER;
+  while (x < right) {
+    mummies.push({ worldX: x, active: false });
+    x += randomMummyGapMeters() * PX_PER_METER;
+  }
+  mummySegmentsSpawned.add(key);
+}
+
+/** Мумии только перед целыми перегородками в зоне генерации. */
+function ensureMummiesAhead() {
+  ensureWallsAhead();
+  const horizon = bgOffset + WIDTH * 2;
+
+  for (const wall of getSortedWalls()) {
+    if (wall.destroyed) continue;
+    if (wall.worldX > horizon) break;
+
+    const left = getSegmentLeftBeforeWall(wall);
+    const right = wall.worldX - MUMMY_WALL_MARGIN;
+    spawnMummiesInRange(left, right, `before-${wall.worldX}`);
+  }
+}
+
+/** После взрыва — новые мумии от стены до следующей перегородки. */
+function spawnMummiesAfterWallDestroyed(wall) {
+  const nextWall = getNextIntactWallAfter(wall.worldX);
+  if (!nextWall) return;
+
+  const left = wall.worldX + WALL_THICKNESS;
+  const right = nextWall.worldX - MUMMY_WALL_MARGIN;
+  spawnMummiesInRange(left, right, `open-${wall.worldX}-${nextWall.worldX}`);
+}
+
 /**
  * Уровень подбородка СТОЯЩЕГО охотника (дно параболы мыши).
  * Учитывает сдвиг спрайта (+12) и типичную долю роста до подбородка.
@@ -360,37 +465,39 @@ function getPitBounds(centerX) {
   return { left: centerX - halfW, right: centerX + halfW };
 }
 
-/** Пересекается ли яма с перегородкой. */
-function pitIntersectsWall(centerX, wall) {
+/** Слишком близко ли яма к перегородке (пересечение или ближе PIT_WALL_MIN_GAP_M). */
+function pitTooCloseToWall(centerX, wall) {
   if (wall.destroyed) return false;
-  const pit = getPitBounds(centerX);
+  const halfW = PIT_DRAW_W / 2;
+  const gap = PIT_WALL_MIN_GAP_M * PX_PER_METER;
   const wallLeft = wall.worldX;
   const wallRight = wall.worldX + WALL_THICKNESS;
-  return pit.left < wallRight && pit.right > wallLeft;
+  const maxCenterBefore = wallLeft - halfW - gap;
+  const minCenterAfter = wallRight + halfW + gap;
+  return centerX > maxCenterBefore && centerX < minCenterAfter;
 }
 
 /**
  * Сдвигает центр ямы так, чтобы она целиком была
- * ДО или ПОСЛЕ каждой перегородки (без пересечения).
+ * ДО или ПОСЛЕ каждой перегородки с зазором не менее 2 м.
  */
 function placePitClearOfWalls(desiredCenter) {
   let center = desiredCenter;
   const halfW = PIT_DRAW_W / 2;
-  const margin = 12;
+  const gap = PIT_WALL_MIN_GAP_M * PX_PER_METER;
   let changed = true;
   let safety = 0;
 
   while (changed && safety++ < 64) {
     changed = false;
     for (const wall of walls) {
-      if (!pitIntersectsWall(center, wall)) continue;
+      if (!pitTooCloseToWall(center, wall)) continue;
 
       const wallLeft = wall.worldX;
       const wallRight = wall.worldX + WALL_THICKNESS;
-      const beforeCenter = wallLeft - halfW - margin;
-      const afterCenter = wallRight + halfW + margin;
+      const beforeCenter = wallLeft - halfW - gap;
+      const afterCenter = wallRight + halfW + gap;
 
-      // Ставим на ближайшую сторону от желаемой позиции
       if (Math.abs(beforeCenter - desiredCenter) <= Math.abs(afterCenter - desiredCenter)) {
         center = beforeCenter;
       } else {
@@ -406,7 +513,7 @@ function placePitClearOfWalls(desiredCenter) {
 
 /**
  * Генерирует ямы с кольями впереди (случайный шаг 160–200 м).
- * Яма не пересекает перегородку — только целиком до или после неё.
+ * Яма не пересекает перегородку и не ближе 2 м к ней.
  */
 function ensureSpikePitsAhead() {
   ensureWallsAhead();
@@ -445,7 +552,7 @@ function drawSpikePits() {
 
 /** Охотник на линии движения (на полу, не в воздухе). */
 function isHunterOnGroundLine() {
-  return !isBatDragging();
+  return !isBatDragging() && !isLongJumping();
 }
 
 /** Яма под ногами охотника (центр тела над проёмом). */
@@ -490,6 +597,8 @@ function getPitSinkPx(hunter) {
 function startPitFall(pit) {
   pitFall = { pit, elapsed: 0 };
   placeAction = null;
+  knifeAction = null;
+  longJump = null;
 }
 
 /** Тикает анимацию провала; по завершении — смерть. */
@@ -507,7 +616,7 @@ function updatePitFall(dt) {
 
 /** Проверяет, не пора ли провалиться в яму под ногами. */
 function checkPitFall() {
-  if (dead || pitFall || !isHunterOnGroundLine() || isPlacingDynamite()) return;
+  if (dead || pitFall || !isHunterOnGroundLine() || isPlacingDynamite() || isKnifeAttacking()) return;
   const pit = getPitUnderHunter();
   if (pit) startPitFall(pit);
 }
@@ -579,6 +688,8 @@ function startBatDrag(bat) {
     remainingPx: BAT_KNOCKBACK_M * PX_PER_METER,
   };
   placeAction = null;
+  knifeAction = null;
+  longJump = null;
 }
 
 /**
@@ -712,6 +823,66 @@ function drawBats() {
   }
 }
 
+/** Тикает мумий: на экране — активны и идут навстречу охотнику (влево по миру). */
+function updateMummies(dt) {
+  if (paused) return;
+
+  const hunterX = getHunterWorldX();
+
+  for (let i = mummies.length - 1; i >= 0; i--) {
+    const m = mummies[i];
+    const screenX = m.worldX - bgOffset;
+
+    if (!m.active && screenX >= -MUMMY_DRAW_H && screenX <= WIDTH + MUMMY_DRAW_H) {
+      m.active = true;
+    }
+
+    if (m.active && !dead && m.worldX > hunterX) {
+      m.worldX -= MUMMY_SPEED * dt;
+      m.worldX = Math.max(m.worldX, hunterX);
+    }
+
+    if (m.worldX < bgOffset - WIDTH * 0.5) {
+      mummies.splice(i, 1);
+    }
+  }
+}
+
+/** Рисует мумий (крупнее охотника, руки вперёд — к охотнику). */
+function drawMummies() {
+  const img = assets.mummy;
+  if (!img.naturalWidth) return;
+
+  const hunterX = getHunterWorldX();
+  const imgH = img.naturalHeight || 1;
+  const scale = MUMMY_DRAW_H / imgH;
+  const drawW = (img.naturalWidth || 1) * scale;
+  const drawH = imgH * scale;
+  const feetPad = 15 * scale;
+
+  for (const m of mummies) {
+    const screenX = m.worldX - bgOffset;
+    if (screenX < -drawW || screenX > WIDTH + drawW) continue;
+
+    const y = SHADOW_CENTER_Y - drawH + feetPad + 12;
+    // Мумия справа от охотника — зеркалим, чтобы руки были направлены к нему
+    const flip = m.worldX >= hunterX ? -1 : 1;
+
+    ctx.save();
+    ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+    ctx.beginPath();
+    ctx.ellipse(screenX, SHADOW_CENTER_Y, drawW * 0.28, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(screenX, y + drawH / 2);
+    ctx.scale(flip, 1);
+    ctx.drawImage(img, -drawW / 2, -drawH / 2, drawW, drawH);
+    ctx.restore();
+  }
+}
+
 /**
  * Расстояние в пикселях от точки (динамита) до плиты стены [worldX, worldX + толщина].
  * 0 — заряд лежит «в» проекции стены.
@@ -734,6 +905,7 @@ function destroyWallsNearBlast(blastWorldX) {
     if (wall.destroyed) continue;
     if (distanceToWallPx(blastWorldX, wall) < radiusPx) {
       wall.destroyed = true;
+      spawnMummiesAfterWallDestroyed(wall);
     }
   }
 }
@@ -785,7 +957,7 @@ function getNextWall() {
 window.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
   // Не даём стрелкам/Esc/E прокручивать страницу и менять фокус
-  if (["arrowleft", "arrowright", "a", "d", "s", "escape", "e"].includes(key)) {
+  if (["arrowleft", "arrowright", "arrowup", "a", "d", "w", "s", "escape", "e", " "].includes(key)) {
     event.preventDefault();
   }
   if (key === "escape") {
@@ -795,6 +967,14 @@ window.addEventListener("keydown", (event) => {
   // E — начать укладку динамита (игнорируем автоповтор удержания клавиши)
   if (key === "e" && !event.repeat) {
     tryStartPlaceDynamite();
+    return;
+  }
+  if (key === " " && !event.repeat) {
+    tryStartKnifeAttack();
+    return;
+  }
+  if (key === "w" && !event.repeat) {
+    tryStartLongJump();
     return;
   }
   keys.add(key);
@@ -825,6 +1005,8 @@ function restartGame() {
   blockedByWall = false;
   dead = false;
   placeAction = null;
+  knifeAction = null;
+  longJump = null;
   batDrag = null;
   pitFall = null;
   pitDeath = null;
@@ -834,8 +1016,11 @@ function restartGame() {
   explosions.length = 0;
   bats.length = 0;
   spikePits.length = 0;
+  mummies.length = 0;
+  mummySegmentsSpawned.clear();
   keys.clear();
   ensureWallsAhead();
+  ensureMummiesAhead();
   ensureBatsAhead();
   ensureSpikePitsAhead();
 }
@@ -878,6 +1063,11 @@ function isMovingRight() {
   return keys.has("arrowright") || keys.has("d");
 }
 
+/** Идёт ли сейчас длинный прыжок. */
+function isLongJumping() {
+  return longJump !== null;
+}
+
 /** Зажата ли S — присед. */
 function isCrouching() {
   return keys.has("s");
@@ -893,8 +1083,73 @@ function isPlacingDynamite() {
  * если персонаж не на паузе и уже не занят укладкой.
  */
 function tryStartPlaceDynamite() {
-  if (paused || dead || isPlacingDynamite() || isCrouching()) return;
+  if (paused || dead || isPlacingDynamite() || isKnifeAttacking() || isCrouching()) return;
   placeAction = { elapsed: 0 };
+}
+
+/** Идёт ли сейчас анимация удара ножом. */
+function isKnifeAttacking() {
+  return knifeAction !== null;
+}
+
+/** Запускает удар ножом по пробелу. */
+function tryStartKnifeAttack() {
+  if (paused || dead || pitFall || isPlacingDynamite() || isKnifeAttacking() || isCrouching() || isBatDragging()) {
+    return;
+  }
+  knifeAction = { elapsed: 0 };
+}
+
+/** Запускает длинный прыжок по W в сторону взгляда (одно нажатие). */
+function tryStartLongJump() {
+  if (
+    paused ||
+    dead ||
+    pitFall ||
+    longJump ||
+    isPlacingDynamite() ||
+    isKnifeAttacking() ||
+    isCrouching() ||
+    isBatDragging()
+  ) {
+    return;
+  }
+
+  const dir = facing || 1;
+  if (dir > 0 && bgOffset >= getMaxOffset() - 0.5) return;
+  if (dir < 0 && bgOffset <= 0.5) return;
+
+  longJump = { remainingPx: LONG_JUMP_DISTANCE, dir };
+}
+
+/** Плавно переносит охотника на оставшуюся дистанцию прыжка. */
+function updateLongJump(dt) {
+  if (!longJump) return;
+
+  blockedByWall = false;
+  const stepMax = Math.min(longJump.remainingPx, LONG_JUMP_SPEED * dt);
+
+  if (longJump.dir > 0) {
+    const maxOffset = getMaxOffset();
+    const room = Math.max(0, maxOffset - bgOffset);
+    const step = Math.min(stepMax, room);
+    bgOffset += step;
+    longJump.remainingPx -= step;
+    if (longJump.remainingPx <= 0.5) {
+      longJump = null;
+    } else if (room <= 0.5) {
+      blockedByWall = true;
+      longJump = null;
+    }
+  } else {
+    const room = Math.max(0, bgOffset);
+    const step = Math.min(stepMax, room);
+    bgOffset -= step;
+    longJump.remainingPx -= step;
+    if (longJump.remainingPx <= 0.5 || room <= 0.5) {
+      longJump = null;
+    }
+  }
 }
 
 /** Мировая X-координата центра охотника (персонаж на экране не двигается). */
@@ -1179,7 +1434,9 @@ function getHunterSprite(moving) {
   if (dead) return assets.hunterDead;
   if (pitFall) return assets.hunter;
   if (isBatDragging()) return assets.hunterFly;
+  if (isLongJumping()) return assets.hunterJumpLong;
   if (isPlacingDynamite()) return assets.hunterPlace;
+  if (isKnifeAttacking()) return assets.hunterKnife;
   if (isCrouching()) return assets.hunterCrouch;
   if (moving) {
     // Чередуем кадры ходьбы: idle и шаг правой ногой
@@ -1197,6 +1454,8 @@ function getSpriteFeetPadPx(hunter) {
   if (hunter === assets.hunterDead) return 5;
   if (hunter === assets.hunterFly) return 20;
   if (hunter === assets.hunterPlace) return 19;
+  if (hunter === assets.hunterKnife) return 16;
+  if (hunter === assets.hunterJumpLong) return 15;
   if (hunter === assets.hunterCrouch) return 16;
   if (hunter === assets.hunterWalkRight) return 21;
   if (hunter === assets.hunterWalkLeft) return 15;
@@ -1220,13 +1479,15 @@ function drawHunter(dt, moving) {
   }
 
   const placing = isPlacingDynamite();
+  const attacking = isKnifeAttacking();
   const dragging = isBatDragging();
+  const jumping = isLongJumping();
   const sinking = getPitSinkProgress() > 0;
   const hunter = getHunterSprite(moving);
 
   // Лёгкое покачивание корпуса в такт шагу
   const bob =
-    moving && !placing && !dead && !isCrouching() && !dragging && !sinking
+    moving && !placing && !attacking && !dead && !isCrouching() && !dragging && !jumping && !sinking
       ? Math.sin(walkPhase * Math.PI) * 3
       : 0;
 
@@ -1240,11 +1501,12 @@ function drawHunter(dt, moving) {
   // Низ картинки ниже ступней на feetPad — компенсируем; +12 — доп. сдвиг только спрайта
   const feetPad = getSpriteFeetPadPx(hunter) * scale;
   const flyLift = dragging ? 48 : 0;
+  const jumpLift = jumping ? LONG_JUMP_LIFT : 0;
   const pitSink = getPitSinkPx(hunter);
-  const y = SHADOW_CENTER_Y - drawH + feetPad + bob + 12 - flyLift + pitSink;
+  const y = SHADOW_CENTER_Y - drawH + feetPad + bob + 12 - flyLift - jumpLift + pitSink;
 
   // Тень: овал на полу, центр = точка опоры
-  if (!sinking && !pitDeath) {
+  if (!sinking && !pitDeath && !jumping && !dragging) {
     ctx.save();
     ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
     ctx.beginPath();
@@ -1381,6 +1643,16 @@ function updatePlaceAction(dt) {
   }
 }
 
+/** Тикает анимацию удара ножом. */
+function updateKnifeAction(dt) {
+  if (!knifeAction || dead) return;
+
+  knifeAction.elapsed += dt;
+  if (knifeAction.elapsed >= KNIFE_ATTACK_DURATION) {
+    knifeAction = null;
+  }
+}
+
 /**
  * Тикает фитиль у зарядов и запускает взрывы через DYNAMITE_FUSE_TIME.
  * Также обновляет и чистит вспышки explosions.
@@ -1416,10 +1688,12 @@ function update(dt) {
   if (paused) return;
 
   ensureWallsAhead();
+  ensureMummiesAhead();
   ensureBatsAhead();
   ensureSpikePitsAhead();
-  // Фитиль, взрывы и полёт мышей — даже после смерти (доиграть анимации)
+  // Фитиль, взрывы, мумии и полёт мышей — даже после смерти (доиграть анимации)
   updateDynamitesAndExplosions(dt);
+  updateMummies(dt);
   updateBats(dt);
 
   if (pitFall) {
@@ -1430,9 +1704,15 @@ function update(dt) {
   if (dead) return;
 
   updatePlaceAction(dt);
+  updateKnifeAction(dt);
+  updateLongJump(dt);
 
-  // Во время укладки, приседа или перетаскивания мышью — управления нет
-  if (isPlacingDynamite() || isCrouching() || isBatDragging()) {
+  if (longJump) {
+    checkPitFall();
+    return;
+  }
+
+  if (isPlacingDynamite() || isKnifeAttacking() || isCrouching() || isBatDragging()) {
     const maxOffset = getMaxOffset();
     blockedByWall = bgOffset >= maxOffset - 0.5;
   } else {
@@ -1467,7 +1747,9 @@ function update(dt) {
  * Реально ли персонаж «шагает» в этом кадре.
  */
 function isActuallyMoving() {
-  if (paused || dead || pitFall || isPlacingDynamite() || isCrouching() || isBatDragging()) return false;
+  if (paused || dead || pitFall || isPlacingDynamite() || isKnifeAttacking() || isCrouching() || isBatDragging() || isLongJumping()) {
+    return false;
+  }
   if (isMovingLeft() && bgOffset > 0) return true;
   if (isMovingRight() && !blockedByWall) return true;
   return false;
@@ -1493,6 +1775,7 @@ function render(dt) {
   drawWalls();
   drawSpikePits();
   drawDynamites();
+  drawMummies();
   drawHunter(dt, isActuallyMoving());
   drawBats(); // мышь поверх охотника
   drawExplosions();
@@ -1514,6 +1797,7 @@ function frame(timestamp) {
 
 // Предварительно создаём первые стены и мышей ещё до первого кадра
 ensureWallsAhead();
+ensureMummiesAhead();
 ensureBatsAhead();
 ensureSpikePitsAhead();
 
