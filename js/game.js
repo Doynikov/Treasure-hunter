@@ -111,6 +111,10 @@ const PIT_MAX_GAP_M = 200;
 /** Размер ямы на экране (px). */
 const PIT_DRAW_W = 488;
 const PIT_DRAW_H = 112;
+/** Длительность провала в яму (сек). */
+const PIT_FALL_DURATION = 0.75;
+/** Запас ниже нижнего края канваса, чтобы спрайт полностью скрылся. */
+const PIT_SINK_BELOW_CANVAS = 32;
 
 // ---------------------------------------------------------------------------
 // Canvas и состояние игры
@@ -159,6 +163,12 @@ let blockedByWall = false;
 
 /** true — охотник погиб от взрыва; управление заблокировано. */
 let dead = false;
+
+/** Активный провал в яму или null: { pit, elapsed }. */
+let pitFall = null;
+
+/** Смерть в яме — для отрисовки «по горло» (после окончания падения). */
+let pitDeath = null;
 
 /**
  * Активное перетаскивание мышью назад или null.
@@ -214,7 +224,7 @@ const spikePits = [];
 
 /** Загруженные картинки: фон, охотник, динамит, взрыв, мыши, яма. */
 const assets = {
-  bg: loadImage("assets/images/pyramid-dungeon-bg.png"),
+  bg: loadImage("assets/images/pyramid-dungeon-bg.jpg"),
   hunter: loadImage("assets/images/hunter-idle.png"),
   hunterWalkLeft: loadImage("assets/images/hunter-walk-left.png"),
   hunterWalkRight: loadImage("assets/images/hunter-walk-right.png"),
@@ -431,6 +441,75 @@ function drawSpikePits() {
     const y = HEIGHT - drawH;
     ctx.drawImage(img, x, y, drawW, drawH);
   }
+}
+
+/** Охотник на линии движения (на полу, не в воздухе). */
+function isHunterOnGroundLine() {
+  return !isBatDragging();
+}
+
+/** Яма под ногами охотника (центр тела над проёмом). */
+function getPitUnderHunter() {
+  const hunterX = getHunterWorldX();
+  const innerMargin = PIT_DRAW_W * 0.14;
+
+  for (const pit of spikePits) {
+    const bounds = getPitBounds(pit.worldX);
+    if (hunterX > bounds.left + innerMargin && hunterX < bounds.right - innerMargin) {
+      return pit;
+    }
+  }
+  return null;
+}
+
+/** На сколько опустить спрайт, чтобы он целиком ушёл за нижний край канваса. */
+function getPitSinkTargetPx(hunter) {
+  const imgH = hunter.naturalHeight || 1;
+  const scale = HUNTER_DRAW_H / imgH;
+  const drawH = imgH * scale;
+  const feetPad = getSpriteFeetPadPx(hunter) * scale;
+  const topY = SHADOW_CENTER_Y - drawH + feetPad + 12;
+  return HEIGHT - topY + PIT_SINK_BELOW_CANVAS;
+}
+
+/** Прогресс провала 0…1 (с ускорением вниз). */
+function getPitSinkProgress() {
+  if (pitFall) {
+    const t = Math.min(1, pitFall.elapsed / PIT_FALL_DURATION);
+    return t * t * t;
+  }
+  if (pitDeath) return 1;
+  return 0;
+}
+
+function getPitSinkPx(hunter) {
+  return getPitSinkTargetPx(hunter) * getPitSinkProgress();
+}
+
+/** Начинает провал в яму. */
+function startPitFall(pit) {
+  pitFall = { pit, elapsed: 0 };
+  placeAction = null;
+}
+
+/** Тикает анимацию провала; по завершении — смерть. */
+function updatePitFall(dt) {
+  if (!pitFall) return;
+
+  pitFall.elapsed += dt;
+  if (pitFall.elapsed >= PIT_FALL_DURATION) {
+    pitDeath = { pit: pitFall.pit };
+    pitFall = null;
+    dead = true;
+    placeAction = null;
+  }
+}
+
+/** Проверяет, не пора ли провалиться в яму под ногами. */
+function checkPitFall() {
+  if (dead || pitFall || !isHunterOnGroundLine() || isPlacingDynamite()) return;
+  const pit = getPitUnderHunter();
+  if (pit) startPitFall(pit);
 }
 
 /**
@@ -747,6 +826,8 @@ function restartGame() {
   dead = false;
   placeAction = null;
   batDrag = null;
+  pitFall = null;
+  pitDeath = null;
   restartBtn = null;
   walls.length = 0;
   dynamites.length = 0;
@@ -1094,7 +1175,9 @@ function drawExplosions() {
  * смерть → dead; укладка → place; ходьба → чередование left/right; иначе idle.
  */
 function getHunterSprite(moving) {
+  if (dead && pitDeath) return assets.hunter;
   if (dead) return assets.hunterDead;
+  if (pitFall) return assets.hunter;
   if (isBatDragging()) return assets.hunterFly;
   if (isPlacingDynamite()) return assets.hunterPlace;
   if (isCrouching()) return assets.hunterCrouch;
@@ -1127,6 +1210,8 @@ function getSpriteFeetPadPx(hunter) {
  * Масштаб: высота холста спрайта → HUNTER_DRAW_H.
  */
 function drawHunter(dt, moving) {
+  if (pitDeath) return;
+
   if (moving) {
     walkPhase += dt * WALK_FPS;
   } else {
@@ -1136,11 +1221,12 @@ function drawHunter(dt, moving) {
 
   const placing = isPlacingDynamite();
   const dragging = isBatDragging();
+  const sinking = getPitSinkProgress() > 0;
   const hunter = getHunterSprite(moving);
 
   // Лёгкое покачивание корпуса в такт шагу
   const bob =
-    moving && !placing && !dead && !isCrouching() && !dragging
+    moving && !placing && !dead && !isCrouching() && !dragging && !sinking
       ? Math.sin(walkPhase * Math.PI) * 3
       : 0;
 
@@ -1154,16 +1240,19 @@ function drawHunter(dt, moving) {
   // Низ картинки ниже ступней на feetPad — компенсируем; +12 — доп. сдвиг только спрайта
   const feetPad = getSpriteFeetPadPx(hunter) * scale;
   const flyLift = dragging ? 48 : 0;
-  const y = SHADOW_CENTER_Y - drawH + feetPad + bob + 12 - flyLift;
+  const pitSink = getPitSinkPx(hunter);
+  const y = SHADOW_CENTER_Y - drawH + feetPad + bob + 12 - flyLift + pitSink;
 
   // Тень: овал на полу, центр = точка опоры
-  ctx.save();
-  ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
-  ctx.beginPath();
-  const shadowW = dead ? drawW * 0.42 : dragging ? drawW * 0.18 : drawW * 0.28;
-  ctx.ellipse(x, SHADOW_CENTER_Y, shadowW, 10, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
+  if (!sinking && !pitDeath) {
+    ctx.save();
+    ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+    ctx.beginPath();
+    const shadowW = dead ? drawW * 0.42 : dragging ? drawW * 0.18 : drawW * 0.28;
+    ctx.ellipse(x, SHADOW_CENTER_Y, shadowW, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
 
   ctx.save();
   ctx.translate(x, y + drawH / 2);
@@ -1333,6 +1422,11 @@ function update(dt) {
   updateDynamitesAndExplosions(dt);
   updateBats(dt);
 
+  if (pitFall) {
+    updatePitFall(dt);
+    return;
+  }
+
   if (dead) return;
 
   updatePlaceAction(dt);
@@ -1341,38 +1435,39 @@ function update(dt) {
   if (isPlacingDynamite() || isCrouching() || isBatDragging()) {
     const maxOffset = getMaxOffset();
     blockedByWall = bgOffset >= maxOffset - 0.5;
-    return;
-  }
-
-  // dir: -1 влево, +1 вправо, 0 — стоим (или зажаты обе стороны)
-  let dir = 0;
-  if (isMovingLeft()) dir -= 1;
-  if (isMovingRight()) dir += 1;
-
-  blockedByWall = false;
-
-  if (dir !== 0) {
-    facing = dir;
-    const next = bgOffset + dir * SCROLL_SPEED * dt;
-    const maxOffset = getMaxOffset();
-
-    if (dir > 0 && next >= maxOffset) {
-      bgOffset = Math.max(0, maxOffset);
-      blockedByWall = true;
-    } else {
-      bgOffset = Math.max(0, next);
-    }
   } else {
-    const maxOffset = getMaxOffset();
-    blockedByWall = bgOffset >= maxOffset - 0.5;
+    // dir: -1 влево, +1 вправо, 0 — стоим (или зажаты обе стороны)
+    let dir = 0;
+    if (isMovingLeft()) dir -= 1;
+    if (isMovingRight()) dir += 1;
+
+    blockedByWall = false;
+
+    if (dir !== 0) {
+      facing = dir;
+      const next = bgOffset + dir * SCROLL_SPEED * dt;
+      const maxOffset = getMaxOffset();
+
+      if (dir > 0 && next >= maxOffset) {
+        bgOffset = Math.max(0, maxOffset);
+        blockedByWall = true;
+      } else {
+        bgOffset = Math.max(0, next);
+      }
+    } else {
+      const maxOffset = getMaxOffset();
+      blockedByWall = bgOffset >= maxOffset - 0.5;
+    }
   }
+
+  checkPitFall();
 }
 
 /**
  * Реально ли персонаж «шагает» в этом кадре.
  */
 function isActuallyMoving() {
-  if (paused || dead || isPlacingDynamite() || isCrouching() || isBatDragging()) return false;
+  if (paused || dead || pitFall || isPlacingDynamite() || isCrouching() || isBatDragging()) return false;
   if (isMovingLeft() && bgOffset > 0) return true;
   if (isMovingRight() && !blockedByWall) return true;
   return false;
