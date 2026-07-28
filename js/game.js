@@ -64,11 +64,28 @@ const HUNTER_HALF_W = (HUNTER_DRAW_H * 0.55) / 2;
 const GROUND_Y = HEIGHT - 70;
 /** Центр овала тени по Y (пол / точка опоры ступней). */
 const SHADOW_CENTER_Y = GROUND_Y + 28;
+/** Положение рельефа Анубиса в мировых координатах. */
+const ANUBIS_FRONT_WORLD_X = 807;
+const ANUBIS_FRONT_Y = 192;
+/** Граница анимации Анубиса при движении вправо (worldX охотника). */
+const ANUBIS_FADE_RIGHT_X = 760;
+/** Граница анимации Анубиса при движении влево (worldX охотника). */
+const ANUBIS_FADE_LEFT_X = 1039;
+/** Длительность появления 0→100% (сек). */
+const ANUBIS_FADE_IN_DURATION = 1;
+/** Пауза в полной непрозрачности перед исчезновением (сек). */
+const ANUBIS_FADE_HOLD_DURATION = 3;
+/** Длительность исчезновения 100%→0 (сек). */
+const ANUBIS_FADE_OUT_DURATION = 1;
 
 /** Длительность анимации «нагнуться и положить динамит» (секунды). */
 const PLACE_DYNAMITE_DURATION = 0.85;
 /** Длительность удара ножом (секунды). */
 const KNIFE_ATTACK_DURATION = 0.45;
+/** Дальность удара ножом вперёд от корпуса охотника (px мира). */
+const KNIFE_REACH = 100;
+/** Момент в анимации удара, когда нож «достаёт» цель (сек). */
+const KNIFE_HIT_TIME = 0.18;
 /** Подъём охотника над полом во время длинного прыжка (px). */
 const LONG_JUMP_LIFT = 52;
 /** Насколько далеко перед охотником кладётся динамит (пиксели мира / экрана). */
@@ -127,14 +144,20 @@ const PIT_FALL_DURATION = 0.75;
 const PIT_SINK_BELOW_CANVAS = 32;
 
 /** Случайный зазор между мумиями в секторе перед стеной (метры). */
-const MUMMY_MIN_GAP_M = 200;
-const MUMMY_MAX_GAP_M = 400;
+const MUMMY_MIN_GAP_M = 100;
+const MUMMY_MAX_GAP_M = 300;
 /** Высота спрайта мумии — на 20% больше охотника. */
 const MUMMY_DRAW_H = HUNTER_DRAW_H * 1.2;
 /** Скорость мумии навстречу охотнику (px мира / сек). */
 const MUMMY_SPEED = 130;
+/** Половина ширины мумии для коллизии со стеной. */
+const MUMMY_HALF_W = (MUMMY_DRAW_H * 0.55) / 2;
 /** Отступ мумий от левого края перегородки (px). */
 const MUMMY_WALL_MARGIN = 90;
+/** Ширина спрайта намоток убитой мумии на экране (px). */
+const MUMMY_WRAPPINGS_W = 240;
+/** Доля пересечения тела охотника с мумией, при которой охотник погибает. */
+const MUMMY_KILL_OVERLAP = 0.5;
 
 // ---------------------------------------------------------------------------
 // Canvas и состояние игры
@@ -213,6 +236,14 @@ let knifeAction = null;
 let longJump = null;
 
 /**
+ * Анимация прозрачности Анубиса или null / завершена.
+ * null — ещё не запускалась; { elapsed, done } — идёт или закончилась.
+ */
+let anubisFade = null;
+/** Предыдущая worldX охотника — для детекта пересечения границ Анубиса. */
+let anubisPrevHunterX = null;
+
+/**
  * Метрики спрайтов больше не читаем через getImageData —
  * при file:// / локальной загрузке canvas «заражался» (CORS) и падал с SecurityError.
  * Спрайты подготовлены на холсте 220×220 с ногами у нижнего края.
@@ -275,6 +306,8 @@ const assets = {
   batFly: loadImage("assets/images/bat-fly.png"),
   spikePit: loadImage("assets/images/spike-pit.png"),
   mummy: loadImage("assets/images/mummy.png"),
+  mummyWrappings: loadImage("assets/images/mummy-wrappings.png"),
+  anubisFront: loadImage("assets/images/anubis-front.jpg"),
 };
 
 /** Сколько шагов (смен спрайта) в секунду при ходьбе. */
@@ -555,28 +588,36 @@ function isHunterOnGroundLine() {
   return !isBatDragging() && !isLongJumping();
 }
 
-/** Яма под ногами охотника (центр тела над проёмом). */
-function getPitUnderHunter() {
-  const hunterX = getHunterWorldX();
+/** Яма под указанной worldX (центр сущности над проёмом). */
+function getPitUnderWorldX(worldX) {
   const innerMargin = PIT_DRAW_W * 0.14;
 
   for (const pit of spikePits) {
     const bounds = getPitBounds(pit.worldX);
-    if (hunterX > bounds.left + innerMargin && hunterX < bounds.right - innerMargin) {
+    if (worldX > bounds.left + innerMargin && worldX < bounds.right - innerMargin) {
       return pit;
     }
   }
   return null;
 }
 
-/** На сколько опустить спрайт, чтобы он целиком ушёл за нижний край канваса. */
+/** Яма под ногами охотника (центр тела над проёмом). */
+function getPitUnderHunter() {
+  return getPitUnderWorldX(getHunterWorldX());
+}
+
+/** На сколько опустить спрайт персонажа, чтобы он целиком ушёл за нижний край канvаса. */
+function getPitSinkTargetPxForFeet(drawH, feetPad) {
+  const topY = SHADOW_CENTER_Y - drawH + feetPad + 12;
+  return HEIGHT - topY + PIT_SINK_BELOW_CANVAS;
+}
+
 function getPitSinkTargetPx(hunter) {
   const imgH = hunter.naturalHeight || 1;
   const scale = HUNTER_DRAW_H / imgH;
   const drawH = imgH * scale;
   const feetPad = getSpriteFeetPadPx(hunter) * scale;
-  const topY = SHADOW_CENTER_Y - drawH + feetPad + 12;
-  return HEIGHT - topY + PIT_SINK_BELOW_CANVAS;
+  return getPitSinkTargetPxForFeet(drawH, feetPad);
 }
 
 /** Прогресс провала 0…1 (с ускорением вниз). */
@@ -823,26 +864,250 @@ function drawBats() {
   }
 }
 
-/** Тикает мумий: на экране — активны и идут навстречу охотнику (влево по миру). */
+/** Минимальная worldX мумии: не заходить в целые перегородки. */
+function getMummyMinXFromWalls(mummyX) {
+  let minX = 0;
+  for (const wall of walls) {
+    if (wall.destroyed) continue;
+    const wallRight = wall.worldX + WALL_THICKNESS;
+    if (mummyX >= wallRight - MUMMY_HALF_W) {
+      minX = Math.max(minX, wallRight + MUMMY_HALF_W);
+    }
+  }
+  return minX;
+}
+
+/** Максимальная worldX мумии слева от целой перегородки. */
+function getMummyMaxXFromWalls(mummyX) {
+  let maxX = Infinity;
+  for (const wall of walls) {
+    if (wall.destroyed) continue;
+    const wallLeft = wall.worldX;
+    if (mummyX <= wallLeft + MUMMY_HALF_W) {
+      maxX = Math.min(maxX, wallLeft - MUMMY_HALF_W);
+    }
+  }
+  return maxX;
+}
+
+function getMummyPitSinkPx(m) {
+  if (!m.pitFall) return 0;
+  const t = Math.min(1, m.pitFall.elapsed / PIT_FALL_DURATION);
+  const progress = t * t * t;
+  const img = assets.mummy;
+  const imgH = img.naturalHeight || 1;
+  const scale = MUMMY_DRAW_H / imgH;
+  const drawH = imgH * scale;
+  const feetPad = 15 * scale;
+  return getPitSinkTargetPxForFeet(drawH, feetPad) * progress;
+}
+
+/** Диапазон worldX, который поражает текущий удар ножом. */
+function getKnifeHitWorldRange() {
+  const hunterX = getHunterWorldX();
+  const near = hunterX + facing * HUNTER_HALF_W * 0.35;
+  const far = near + facing * KNIFE_REACH;
+  return { min: Math.min(near, far), max: Math.max(near, far) };
+}
+
+function isMummyInKnifeRange(m) {
+  const { min, max } = getKnifeHitWorldRange();
+  return m.worldX + MUMMY_HALF_W >= min && m.worldX - MUMMY_HALF_W <= max;
+}
+
+/** Убивает мумию — на полу остаётся куча бинтов. */
+function killMummy(m) {
+  m.dead = true;
+  m.pitFall = null;
+  m.stopped = false;
+}
+
+/** Прямоугольник тела охотника для коллизий (worldX + screenY). */
+function getHunterBodyRect() {
+  const moving =
+    !paused &&
+    !dead &&
+    !pitFall &&
+    !isPlacingDynamite() &&
+    !isKnifeAttacking() &&
+    !isCrouching() &&
+    !isBatDragging() &&
+    !isLongJumping() &&
+    ((isMovingLeft() && bgOffset > 0) || (isMovingRight() && !blockedByWall));
+  const hunter = getHunterSprite(moving);
+  const imgH = hunter.naturalHeight || 1;
+  const scale = HUNTER_DRAW_H / imgH;
+  const drawH = imgH * scale;
+  const feetPad = getSpriteFeetPadPx(hunter) * scale;
+  const jumpLift = isLongJumping() ? LONG_JUMP_LIFT : 0;
+  const flyLift = isBatDragging() ? 48 : 0;
+  const top = SHADOW_CENTER_Y - drawH + feetPad + 12 - flyLift - jumpLift;
+  const centerX = getHunterWorldX();
+
+  return {
+    left: centerX - HUNTER_HALF_W,
+    right: centerX + HUNTER_HALF_W,
+    top,
+    bottom: top + drawH,
+  };
+}
+
+/** Прямоугольник тела мумии для коллизий (worldX + screenY). */
+function getMummyBodyRect(m) {
+  const img = assets.mummy;
+  const imgH = img.naturalHeight || 1;
+  const scale = MUMMY_DRAW_H / imgH;
+  const drawH = imgH * scale;
+  const feetPad = 15 * scale;
+  const top = SHADOW_CENTER_Y - drawH + feetPad + 12;
+
+  return {
+    left: m.worldX - MUMMY_HALF_W,
+    right: m.worldX + MUMMY_HALF_W,
+    top,
+    bottom: top + drawH,
+  };
+}
+
+function getRectOverlapArea(a, b) {
+  const overlapW = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+  const overlapH = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+  return overlapW * overlapH;
+}
+
+/** Смерть охотника при сильном пересечении с живой мумией; мумия замирает на месте. */
+function checkMummyContactKill() {
+  if (dead || pitFall || isBatDragging()) return;
+
+  const hunterRect = getHunterBodyRect();
+  const hunterArea = (hunterRect.right - hunterRect.left) * (hunterRect.bottom - hunterRect.top);
+  if (hunterArea <= 0) return;
+
+  for (const m of mummies) {
+    if (m.dead || m.pitFall || m.stopped) continue;
+
+    const overlap = getRectOverlapArea(hunterRect, getMummyBodyRect(m));
+    if (overlap / hunterArea > MUMMY_KILL_OVERLAP) {
+      m.stopped = true;
+      dead = true;
+      placeAction = null;
+      knifeAction = null;
+      longJump = null;
+      return;
+    }
+  }
+}
+
+/** Проверяет попадание ножом по мумиям (один раз за замах). */
+function applyKnifeHitsToMummies() {
+  if (!knifeAction || knifeAction.hitApplied) return;
+  if (knifeAction.elapsed < KNIFE_HIT_TIME) return;
+
+  knifeAction.hitApplied = true;
+
+  for (const m of mummies) {
+    if (m.dead || m.pitFall) continue;
+    if (isMummyInKnifeRange(m)) {
+      killMummy(m);
+    }
+  }
+}
+
+/** Убивает мышь, которая тащит охотника, и прекращает перетаскивание. */
+function killDraggingBat() {
+  if (!batDrag) return;
+  batDrag.bat.state = "gone";
+  batDrag = null;
+}
+
+/** Удар ножом по мыши на подбородке во время перетаскивания. */
+function applyKnifeHitsToBat() {
+  if (!knifeAction || knifeAction.batHitApplied) return;
+  if (knifeAction.elapsed < KNIFE_HIT_TIME) return;
+  if (!batDrag) return;
+
+  knifeAction.batHitApplied = true;
+  killDraggingBat();
+}
+
+/** Рисует спрайт намоток на полу (убитая мумия). */
+function drawMummyBandages(screenX) {
+  const img = assets.mummyWrappings;
+  if (!img.naturalWidth) return;
+
+  const imgW = img.naturalWidth || 1;
+  const imgH = img.naturalHeight || 1;
+  const scale = MUMMY_WRAPPINGS_W / imgW;
+  const drawW = imgW * scale;
+  const drawH = imgH * scale;
+  const x = screenX - drawW / 2;
+  const y = SHADOW_CENTER_Y - drawH + 8;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.34)";
+  ctx.beginPath();
+  ctx.ellipse(screenX, SHADOW_CENTER_Y + 4, drawW * 0.38, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.drawImage(img, x, y, drawW, drawH);
+}
+
+/** Тикает мумий: на экране — активны и идут за охотником (влево и вправо). */
 function updateMummies(dt) {
   if (paused) return;
 
+  ensureSpikePitsAhead();
   const hunterX = getHunterWorldX();
 
   for (let i = mummies.length - 1; i >= 0; i--) {
     const m = mummies[i];
     const screenX = m.worldX - bgOffset;
 
+    if (m.dead) {
+      if (m.worldX < bgOffset - WIDTH * 0.5) {
+        mummies.splice(i, 1);
+      }
+      continue;
+    }
+
+    if (m.pitFall) {
+      m.pitFall.elapsed += dt;
+      if (m.pitFall.elapsed >= PIT_FALL_DURATION) {
+        mummies.splice(i, 1);
+      }
+      continue;
+    }
+
     if (!m.active && screenX >= -MUMMY_DRAW_H && screenX <= WIDTH + MUMMY_DRAW_H) {
       m.active = true;
     }
 
-    if (m.active && !dead && m.worldX > hunterX) {
-      m.worldX -= MUMMY_SPEED * dt;
-      m.worldX = Math.max(m.worldX, hunterX);
+    if (getPitUnderWorldX(m.worldX)) {
+      m.pitFall = { elapsed: 0 };
+      continue;
     }
 
-    if (m.worldX < bgOffset - WIDTH * 0.5) {
+    if (m.active && !dead && !m.stopped) {
+      const dx = hunterX - m.worldX;
+      if (Math.abs(dx) > 0.5) {
+        const step = Math.min(MUMMY_SPEED * dt, Math.abs(dx));
+        let newX = m.worldX + Math.sign(dx) * step;
+
+        if (newX > m.worldX) {
+          newX = Math.min(newX, getMummyMaxXFromWalls(m.worldX));
+        } else {
+          newX = Math.max(newX, getMummyMinXFromWalls(m.worldX));
+        }
+        m.worldX = newX;
+
+        if (getPitUnderWorldX(m.worldX)) {
+          m.pitFall = { elapsed: 0 };
+        }
+      }
+    }
+
+    if (!m.active && m.worldX < bgOffset - WIDTH * 0.5) {
       mummies.splice(i, 1);
     }
   }
@@ -864,16 +1129,24 @@ function drawMummies() {
     const screenX = m.worldX - bgOffset;
     if (screenX < -drawW || screenX > WIDTH + drawW) continue;
 
-    const y = SHADOW_CENTER_Y - drawH + feetPad + 12;
+    if (m.dead) {
+      drawMummyBandages(screenX);
+      continue;
+    }
+
+    const y = SHADOW_CENTER_Y - drawH + feetPad + 12 + getMummyPitSinkPx(m);
+    const sinking = m.pitFall != null;
     // Мумия справа от охотника — зеркалим, чтобы руки были направлены к нему
     const flip = m.worldX >= hunterX ? -1 : 1;
 
-    ctx.save();
-    ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
-    ctx.beginPath();
-    ctx.ellipse(screenX, SHADOW_CENTER_Y, drawW * 0.28, 10, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
+    if (!sinking) {
+      ctx.save();
+      ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+      ctx.beginPath();
+      ctx.ellipse(screenX, SHADOW_CENTER_Y, drawW * 0.28, 10, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
 
     ctx.save();
     ctx.translate(screenX, y + drawH / 2);
@@ -961,7 +1234,14 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
   }
   if (key === "escape") {
+    if (isBatDragging()) return;
     paused = !paused;
+    return;
+  }
+  if (isBatDragging()) {
+    if (key === " " && !event.repeat) {
+      tryStartKnifeAttack();
+    }
     return;
   }
   // E — начать укладку динамита (игнорируем автоповтор удержания клавиши)
@@ -1010,6 +1290,8 @@ function restartGame() {
   batDrag = null;
   pitFall = null;
   pitDeath = null;
+  anubisFade = null;
+  anubisPrevHunterX = null;
   restartBtn = null;
   walls.length = 0;
   dynamites.length = 0;
@@ -1083,7 +1365,7 @@ function isPlacingDynamite() {
  * если персонаж не на паузе и уже не занят укладкой.
  */
 function tryStartPlaceDynamite() {
-  if (paused || dead || isPlacingDynamite() || isKnifeAttacking() || isCrouching()) return;
+  if (paused || dead || isBatDragging() || isPlacingDynamite() || isKnifeAttacking() || isCrouching()) return;
   placeAction = { elapsed: 0 };
 }
 
@@ -1094,9 +1376,14 @@ function isKnifeAttacking() {
 
 /** Запускает удар ножом по пробелу. */
 function tryStartKnifeAttack() {
-  if (paused || dead || pitFall || isPlacingDynamite() || isKnifeAttacking() || isCrouching() || isBatDragging()) {
+  if (paused || dead || pitFall || isKnifeAttacking()) return;
+
+  if (isBatDragging()) {
+    knifeAction = { elapsed: 0 };
     return;
   }
+
+  if (isPlacingDynamite() || isCrouching()) return;
   knifeAction = { elapsed: 0 };
 }
 
@@ -1209,6 +1496,77 @@ function drawBackground() {
     ctx.drawImage(bg, x, 0, drawW, drawH);
     x += drawW;
   }
+}
+
+function getAnubisFadeTotalDuration() {
+  return ANUBIS_FADE_IN_DURATION + ANUBIS_FADE_HOLD_DURATION + ANUBIS_FADE_OUT_DURATION;
+}
+
+/** Непрозрачность Анубиса: 1 = 100%, 0 = полностью прозрачен. */
+function getAnubisOpacity() {
+  if (!anubisFade) return 0;
+
+  const t = anubisFade.elapsed;
+  const fadeInEnd = ANUBIS_FADE_IN_DURATION;
+  const holdEnd = fadeInEnd + ANUBIS_FADE_HOLD_DURATION;
+  const fadeOutEnd = holdEnd + ANUBIS_FADE_OUT_DURATION;
+
+  if (t < fadeInEnd) return t / ANUBIS_FADE_IN_DURATION;
+  if (t < holdEnd) return 1;
+  if (t < fadeOutEnd) return 1 - (t - holdEnd) / ANUBIS_FADE_OUT_DURATION;
+  return 0;
+}
+
+/** Перезапускает анимацию появления/исчезновения Анубиса. */
+function startAnubisFade() {
+  anubisFade = { elapsed: 0, done: false };
+}
+
+/**
+ * Тик анимации Анубиса.
+ * Срабатывает каждый раз при пересечении:
+ * — 760 px при движении вправо;
+ * — 1039 px при движении влево.
+ * Анимация: 0 → 100% за 1 с, пауза 3 с, затем 100% → 0 за 1 с.
+ */
+function updateAnubisFade(dt) {
+  const hunterX = getHunterWorldX();
+
+  if (anubisPrevHunterX != null) {
+    const crossedRight =
+      anubisPrevHunterX < ANUBIS_FADE_RIGHT_X && hunterX >= ANUBIS_FADE_RIGHT_X;
+    const crossedLeft =
+      anubisPrevHunterX > ANUBIS_FADE_LEFT_X && hunterX <= ANUBIS_FADE_LEFT_X;
+    if (crossedRight || crossedLeft) {
+      startAnubisFade();
+    }
+  }
+  anubisPrevHunterX = hunterX;
+
+  if (!anubisFade || anubisFade.done) return;
+
+  anubisFade.elapsed += dt;
+  const total = getAnubisFadeTotalDuration();
+  if (anubisFade.elapsed >= total) {
+    anubisFade.elapsed = total;
+    anubisFade.done = true;
+  }
+}
+
+/** Рисует рельеф Анубиса как часть прокручиваемого мира. */
+function drawAnubisFront() {
+  const img = assets.anubisFront;
+  const screenX = ANUBIS_FRONT_WORLD_X - bgOffset;
+  const drawW = img.naturalWidth || 155;
+  const drawH = img.naturalHeight || 256;
+  const alpha = getAnubisOpacity();
+
+  if (alpha <= 0.001 || screenX + drawW < 0 || screenX > WIDTH) return;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(img, screenX, ANUBIS_FRONT_Y, drawW, drawH);
+  ctx.restore();
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,6 +1791,7 @@ function getHunterSprite(moving) {
   if (dead && pitDeath) return assets.hunter;
   if (dead) return assets.hunterDead;
   if (pitFall) return assets.hunter;
+  if (isBatDragging() && isKnifeAttacking()) return assets.hunterKnife;
   if (isBatDragging()) return assets.hunterFly;
   if (isLongJumping()) return assets.hunterJumpLong;
   if (isPlacingDynamite()) return assets.hunterPlace;
@@ -1648,6 +2007,8 @@ function updateKnifeAction(dt) {
   if (!knifeAction || dead) return;
 
   knifeAction.elapsed += dt;
+  applyKnifeHitsToBat();
+  applyKnifeHitsToMummies();
   if (knifeAction.elapsed >= KNIFE_ATTACK_DURATION) {
     knifeAction = null;
   }
@@ -1695,9 +2056,16 @@ function update(dt) {
   updateDynamitesAndExplosions(dt);
   updateMummies(dt);
   updateBats(dt);
+  updateAnubisFade(dt);
 
   if (pitFall) {
     updatePitFall(dt);
+    return;
+  }
+
+  if (isBatDragging()) {
+    blockedByWall = bgOffset >= getMaxOffset() - 0.5;
+    updateKnifeAction(dt);
     return;
   }
 
@@ -1712,7 +2080,7 @@ function update(dt) {
     return;
   }
 
-  if (isPlacingDynamite() || isKnifeAttacking() || isCrouching() || isBatDragging()) {
+  if (isPlacingDynamite() || isKnifeAttacking() || isCrouching()) {
     const maxOffset = getMaxOffset();
     blockedByWall = bgOffset >= maxOffset - 0.5;
   } else {
@@ -1741,6 +2109,7 @@ function update(dt) {
   }
 
   checkPitFall();
+  checkMummyContactKill();
 }
 
 /**
@@ -1772,6 +2141,7 @@ function render(dt) {
   }
 
   drawBackground();
+  drawAnubisFront();
   drawWalls();
   drawSpikePits();
   drawDynamites();
